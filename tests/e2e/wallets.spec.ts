@@ -78,10 +78,17 @@ test.describe('Route loading UX', () => {
     const error = page.getByTestId('route-loading-error');
     await expect(error).toBeVisible({ timeout: ROUTE_LOADING_TIMEOUT_MS });
 
-    const text = (await error.textContent()) ?? '';
-    // Redaction guard: no raw key material, JWTs, or webhook secrets in the UI.
-    expect(text).not.toMatch(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
-    expect(text).not.toMatch(/S[A-Z2-7]{55}/);
-    expect(text).not.toMatch(/whsec_[A-Za-z0-9]+/);
+    // Check the element's full outerHTML, not just its visible textContent --
+    // a regression could leak a token or raw backend error string into a
+    // data-* attribute (e.g. data-correlation-id, data-error-code) without
+    // ever showing up in textContent.
+    const html = (await error.evaluate((el) => el.outerHTML)) ?? '';
+    // Redaction guard: no raw key material, JWTs, bearer/API tokens, or
+    // webhook secrets anywhere in the error surface.
+    expect(html).not.toMatch(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+    expect(html).not.toMatch(/S[A-Z2-7]{55}/);
+    expect(html).not.toMatch(/whsec_[A-Za-z0-9]+/);
+    expect(html).not.toMatch(/Bearer\s+[A-Za-z0-9._-]+/);
+    expect(html).not.toMatch(/sk_live_[A-Za-z0-9]+/);
   });
 });

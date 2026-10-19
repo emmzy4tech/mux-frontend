@@ -20,6 +20,12 @@ export function useRetryCountdown(
 
 	useEffect(() => {
 		if (retryAt === null) return;
+		// Already elapsed (e.g. a cached 429 whose Retry-After has already
+		// passed): reflect that immediately and never start a timer.
+		if (now() >= retryAt) {
+			setNowMs(now());
+			return;
+		}
 		const tick = () => {
 			const current = now();
 			setNowMs(current);

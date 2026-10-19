@@ -45,6 +45,30 @@ describe("parseAuditPageParams", () => {
 		});
 	});
 
+	it("returns the documented defaults for a completely empty query (issue #958)", () => {
+		expect(parse("")).toEqual({
+			ok: true,
+			query: { filters: {}, cursor: null, limit: DEFAULT_AUDIT_PAGE_SIZE },
+		});
+	});
+
+	// #958: the parser only ever reads named params off a hardcoded allow-list
+	// (PAGE_PARAMS / the `["actor","action"]` / `["from","to"]` loops), so a
+	// `__proto__`/`constructor` key can never be used to set a property on the
+	// returned `filters`/`query` objects. This pins that down so a future
+	// refactor to a dynamic `for (const key of params.keys())` loop would be
+	// caught here rather than silently reintroducing prototype pollution.
+	it("ignores __proto__ and constructor query keys without polluting the result", () => {
+		const result = parse("__proto__=evil&constructor=evil&actor=member_admin");
+		expect(result).toEqual({
+			ok: true,
+			query: { filters: { actor: "member_admin" }, cursor: null, limit: 50 },
+		});
+		if (!result.ok) throw new Error("expected ok");
+		expect(Object.getPrototypeOf(result.query.filters)).toBe(Object.prototype);
+		expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+	});
+
 	it("normalises valid filters", () => {
 		const result = parse(
 			"actor=member_admin&action=wallet.send&from=2026-01-01&to=2026-01-02T00:00:00Z&limit=10",

@@ -94,6 +94,17 @@ describe('POST /api/wallets auth checks', () => {
     expect(res.status).toBe(503);
     expect(await errorCode(res)).toBe(OnboardingErrorCode.UPSTREAM_UNAVAILABLE);
   });
+
+  it('rejects a label longer than 128 characters', async () => {
+    const res = await POST(walletRequest({ label: 'x'.repeat(129) }));
+    expect(res.status).toBe(400);
+    expect(await errorCode(res)).toBe(OnboardingErrorCode.INVALID_REQUEST);
+  });
+
+  it('accepts a label at exactly 128 characters', async () => {
+    const res = await POST(walletRequest({ label: 'x'.repeat(128) }));
+    expect(await errorCode(res)).not.toBe(OnboardingErrorCode.INVALID_REQUEST);
+  });
 });
 
 describe('POST /api/wallets network param', () => {

@@ -345,107 +345,49 @@ export async function POST(request: Request): Promise<NextResponse> {
 			);
 		}
 
-		if (upstream.status === 401 || upstream.status === 403) {
-			return errorResponse(
-				upstream.status,
-				SEND_ERROR_CODES.FORBIDDEN,
-				"The credential is not authorized to send.",
-				correlationId,
-				{},
-				gate.network,
-			);
-		}
-
 		const code = upstreamCode(upstreamBody);
-		if (code === "insufficient_funds") {
-			return errorResponse(
-				402,
-				SEND_ERROR_CODES.INSUFFICIENT_FUNDS,
-				"Insufficient funds for this send.",
-				correlationId,
-				{},
-				gate.network,
-			);
-		}
-
-		if (upstream.status === 400 || upstream.status === 422) {
-			return errorResponse(
-				400,
-				SEND_ERROR_CODES.INVALID_INPUT,
-				"The send request was rejected.",
-				correlationId,
-				{},
-				gate.network,
-			);
-		}
-				gate.network,
-			);
-		}
 
 		if (upstream.status === 401 || upstream.status === 403) {
-			return errorResponse(
-				upstream.status,
-				SEND_ERROR_CODES.FORBIDDEN,
-				"The credential is not authorized to send.",
-				correlationId,
-				{},
-				gate.network,
-			);
-		}
-
-		const code = upstreamCode(upstreamBody);
-		if (code === "insufficient_funds") {
-			return errorResponse(
-				402,
-				SEND_ERROR_CODES.INSUFFICIENT_FUNDS,
-				"Insufficient funds for this send.",
-				correlationId,
-				{},
-				gate.network,
-			);
-		}
-		if (upstream.status === 400 || upstream.status === 422) {
-			return errorResponse(
-				400,
-				SEND_ERROR_CODES.INVALID_INPUT,
-				"The send request was rejected.",
-				correlationId,
-				{},
-				gate.network,
-			);
-		}
-		if (code === "unauthorized" || upstream.status === 401) {
-			return errorResponse(
-				401,
-				SEND_ERROR_CODES.UNAUTHORIZED,
-				"A valid owner, delegate, API key, or JWT credential is required.",
-				correlationId,
-				{},
-				gate.network,
-			);
-		}
-		if (code === "forbidden" || upstream.status === 403) {
+			if (code === "token_expired") {
+				return errorResponse(
+					401,
+					SEND_ERROR_CODES.AUTH_EXPIRED,
+					"The credential has expired. Sign in again.",
+					correlationId,
+					{},
+					gate.network,
+				);
+			}
+			if (code === "delegate_revoked") {
+				return errorResponse(
+					403,
+					SEND_ERROR_CODES.DELEGATE_REVOKED,
+					"This delegate's access has been revoked.",
+					correlationId,
+					{},
+					gate.network,
+				);
+			}
+			if (upstream.status === 401) {
+				return errorResponse(
+					401,
+					SEND_ERROR_CODES.UNAUTHORIZED,
+					"A valid owner, delegate, API key, or JWT credential is required.",
+					correlationId,
+					{},
+					gate.network,
+				);
+			}
 			return errorResponse(
 				403,
 				SEND_ERROR_CODES.FORBIDDEN,
 				"This credential is not allowed to send.",
-				c
 				correlationId,
 				{},
 				gate.network,
 			);
 		}
-		const code = upstreamCode(upstreamBody);
-		if (code === "insufficient_funds") {
-			return errorResponse(
-				402,
-				SEND_ERROR_CODES.INSUFFICIENT_FUNDS,
-				"Insufficient funds for this send.",
-				correlationId,
-				{},
-				gate.network,
-			);
-		}
+
 		if (upstream.status === 400 || upstream.status === 422) {
 			return errorResponse(
 				400,
@@ -453,10 +395,6 @@ export async function POST(request: Request): Promise<NextResponse> {
 				"The send request was rejected.",
 				correlationId,
 				{},
-				gate.network,
-			);
-		}
-
 				gate.network,
 			);
 		}
@@ -464,7 +402,7 @@ export async function POST(request: Request): Promise<NextResponse> {
 		return errorResponse(
 			502,
 			SEND_ERROR_CODES.UPSTREAM_ERROR,
-			`Upstream send failed${upstreamCode(upstreamBody) ? `: ${upstreamCode(upstreamBody)}` : ""}.`,
+			`Upstream send failed${code ? `: ${code}` : ""}.`,
 			correlationId,
 			{},
 			gate.network,

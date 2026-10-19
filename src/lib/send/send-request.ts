@@ -52,6 +52,7 @@ const DESTINATION_RE = /^[GC][A-Z2-7]{55}$/;
 const AMOUNT_RE = /^(0|[1-9]\d{0,11})(\.\d{1,7})?$/;
 const ASSET_RE = /^(native|[A-Za-z0-9]{1,12}:G[A-Z2-7]{55})$/;
 const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_-]{16,128}$/;
+const NETWORK_RE = /^[a-z0-9-]{1,32}$/i;
 const MAX_MEMO_BYTES = 28;
 
 export function isValidIdempotencyKey(value: string): boolean {
@@ -60,6 +61,11 @@ export function isValidIdempotencyKey(value: string): boolean {
 
 export function parseSendBody(raw: unknown): SendRequestBody | null {
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		return null;
+	}
+	// Reject oversized bodies before any further validation (fail closed on
+	// size before we ever inspect field contents).
+	if (new TextEncoder().encode(JSON.stringify(raw)).length > MAX_BODY_BYTES) {
 		return null;
 	}
 	const body = raw as Record<string, unknown>;
@@ -80,7 +86,7 @@ export function parseSendBody(raw: unknown): SendRequestBody | null {
 		return null;
 	}
 	if (typeof asset !== "string" || !ASSET_RE.test(asset)) return null;
-	if (typeof network !== "string") return null;
+	if (typeof network !== "string" || !NETWORK_RE.test(network)) return null;
 	if (
 		memo !== undefined &&
 		(typeof memo !== "string" ||

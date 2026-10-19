@@ -157,6 +157,48 @@ describe('GET /api/wallets/[id] envelope parsing', () => {
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(parseEnvelope).not.toHaveBeenCalled();
   });
+
+  it('rejects oversized payloads with a defined error code, not just a status', async () => {
+    const huge = 'x'.repeat(2 * 1024 * 1024);
+    const res = await GET(
+      makeRequest('GET', { rawBody: huge, headers: { 'content-type': 'application/json' } }),
+      ctx(),
+    );
+    const json = await res.json();
+
+    expect(json.error.code).toBeDefined();
+    expect(parseEnvelope).not.toHaveBeenCalled();
+  });
+
+  it('preserves an explicit 4xx envelope status instead of collapsing it to 500', async () => {
+    parseEnvelope.mockResolvedValue({
+      data: null,
+      error: { code: 'WALLET_LOCKED', message: 'wallet is locked' },
+      correlationId: 'corr-404-explicit',
+      status: 404,
+    });
+
+    const res = await GET(makeRequest('GET'), ctx());
+    const json = await res.json();
+
+    expect(res.status).toBe(404);
+    expect(json.error.code).toBe('WALLET_LOCKED');
+  });
+
+  it('rejects an envelope with both data and error explicitly null', async () => {
+    parseEnvelope.mockResolvedValue({
+      data: null,
+      error: null,
+      correlationId: 'corr-both-null',
+    });
+
+    const res = await GET(makeRequest('GET'), ctx());
+    const json = await res.json();
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(json.error).toBeDefined();
+    expect(json.error.code).toBeDefined();
+  });
 });
 
 describe('GET /api/wallets/[id] receive payload', () => {
@@ -280,6 +322,48 @@ describe('POST /api/wallets/[id] envelope parsing auth negatives', () => {
     );
 
     expect(res.status).toBe(403);
+  });
+});
+
+describe('POST /api/wallets/[id] request validation', () => {
+  const OWNER_AUTH = { authorization: 'Bearer owner.token.value' };
+
+  beforeEach(() => {
+    applySettings.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('rejects a malformed (non-JSON) body with a stable error code before touching the store', async () => {
+    const res = await POST(
+      makeRequest('POST', {
+        rawBody: '{not valid json',
+        headers: { ...OWNER_AUTH, 'content-type': 'application/json' },
+      }),
+      ctx(),
+    );
+    const json = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(json.error.code).toBe(WalletSettingsErrorCode.INVALID_INPUT);
+    expect(applySettings).not.toHaveBeenCalled();
+  });
+
+  it('rejects a body that is valid JSON but not an object', async () => {
+    const res = await POST(
+      makeRequest('POST', {
+        rawBody: '"just a string"',
+        headers: { ...OWNER_AUTH, 'content-type': 'application/json' },
+      }),
+      ctx(),
+    );
+    const json = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(json.error.code).toBe(WalletSettingsErrorCode.INVALID_INPUT);
+    expect(applySettings).not.toHaveBeenCalled();
   });
 });
 

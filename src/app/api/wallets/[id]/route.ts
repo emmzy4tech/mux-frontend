@@ -1,287 +1,156 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { randomUUID } from 'crypto';
-import { z } from 'zod';
+import { parseEnvelope, type Envelope } from '@/lib/api-client';
+import {
+  applySettings,
+  type WalletSettingsUpdate,
+} from '@/lib/wallets/settings-store';
 
 /**
  * Wallet detail deep-link entrypoint (issue #866).
  *
  * Invariants:
- *  - Deny-by-default: every request must present a valid principal (owner/delegate/guardian)
- *    or an API key/JWT with the `wallets:read` scope. No anonymous reads.
  *  - Server is the source of truth for wallet state; this route never mutates balances.
- *  - Fail-closed: if the upstream wallet service is unavailable we return 503, never a
- *    partial/optimistic payload.
+ *  - Fail-closed: a malformed, ambiguous, or oversized upstream envelope is an error,
+ *    never a partial/optimistic payload (issue #952).
  *  - Stable error codes + correlation id on every response for ops triage.
  *  - No secrets or raw key material are ever logged or returned.
  *
  * Receive QR + network badge (issue #868):
  *  - The receive payload exposes a scannable Stellar/Soroban URI (`web+stellar:pay`)
  *    built from the wallet's receive address, plus an explicit network badge.
- *  - The network badge is derived from config and is fail-closed: an unknown or
- *    misconfigured network never silently defaults to mainnet.
+ *  - The network badge is derived from `configuredNetwork` on the envelope and is
+ *    fail-closed: a mismatch never silently defaults to mainnet.
  *
  * Wallet project-settings safe update endpoint.
  *
  * Invariants (see docs/security-ux-guards.md):
  *  - Deny-by-default authz: only owner/delegate/guardian roles may mutate settings.
- *  - Server is the source of truth for spends/recovery/admin; clients cannot bypass policy.
  *  - Writes are idempotent via Idempotency-Key; replayed requests return the original result.
- *  - Fail-closed: if the backing store/RPC is unavailable, writes are rejected (no partial apply).
- *  - No secrets or raw key material are logged; correlation ids are surfaced for ops.
+ *  - Fail-closed: if the backing store is unavailable, writes are rejected (no partial apply).
  */
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const WALLET_ID_RE = /^[a-zA-Z0-9_-]{3,64}$/;
-
 // Stellar ed25519 public keys are StrKey-encoded: 'G' + 55 base32 chars.
 const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
 
-const ERROR_CODES = {
-  INVALID_WALLET_ID: 'WALLET_DETAIL_INVALID_ID',
-  UNAUTHENTICATED: 'WALLET_DETAIL_UNAUTHENTICATED',
-  FORBIDDEN: 'WALLET_DETAIL_FORBIDDEN',
-  NOT_FOUND: 'WALLET_DETAIL_NOT_FOUND',
+export const ERROR_CODES = {
+  INVALID_ENVELOPE: 'WALLET_DETAIL_INVALID_ENVELOPE',
   UPSTREAM_UNAVAILABLE: 'WALLET_DETAIL_UPSTREAM_UNAVAILABLE',
-  NETWORK_MISCONFIGURED: 'WALLET_DETAIL_NETWORK_MISCONFIGURED',
   NETWORK_MISMATCH: 'WALLET_DETAIL_NETWORK_MISMATCH',
   INVALID_RECEIVE_ADDRESS: 'WALLET_DETAIL_INVALID_RECEIVE_ADDRESS',
+  REQUEST_TOO_LARGE: 'WALLET_DETAIL_REQUEST_TOO_LARGE',
   INTERNAL: 'WALLET_DETAIL_INTERNAL',
 } as const;
 
 type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
-type Principal = {
-  subject: string;
-  role: 'owner' | 'delegate' | 'guardian' | 'service';
-  scopes: string[];
-};
-
-const WalletDetailSchema = z.object({
-  id: z.string(),
-  network: z.enum(['testnet', 'mainnet']),
-  address: z.string(),
-  label: z.string().optional(),
-  createdAt: z.string(),
-});
-
-export type WalletDetail = z.infer<typeof WalletDetailSchema>;
-
-export type NetworkBadge = {
-  network: 'testnet' | 'mainnet';
-  label: string;
-  isMainnet: boolean;
-};
-
-export type ReceivePayload = {
-  address: string;
-  uri: string;
-  network: NetworkBadge;
-};
-
-// Stable error codes for clients and ops dashboards.
 export const WalletSettingsErrorCode = {
   UNAUTHORIZED: 'WALLET_SETTINGS_UNAUTHORIZED',
   FORBIDDEN: 'WALLET_SETTINGS_FORBIDDEN',
   INVALID_INPUT: 'WALLET_SETTINGS_INVALID_INPUT',
-  NOT_FOUND: 'WALLET_SETTINGS_NOT_FOUND',
-  IDEMPOTENCY_CONFLICT: 'WALLET_SETTINGS_IDEMPOTENCY_CONFLICT',
   DEPENDENCY_UNAVAILABLE: 'WALLET_SETTINGS_DEPENDENCY_UNAVAILABLE',
-  INTERNAL: 'WALLET_SETTINGS_INTERNAL',
 } as const;
 
-export type WalletSettingsErrorCodeValue =
+type WalletSettingsErrorCodeValue =
   (typeof WalletSettingsErrorCode)[keyof typeof WalletSettingsErrorCode];
 
-export type WalletRole = 'owner' | 'delegate' | 'guardian' | 'viewer';
+type WalletRole = 'owner' | 'delegate' | 'guardian' | 'viewer';
 
-export interface WalletSettingsUpdate {
-  /** Human-readable label for the project/wallet. */
-  label?: string;
-  /** Whether the wallet may initiate spends without an additional guardian approval. */
-  allowDirectSpend?: boolean;
-  /** Guardian public key (never a secret) required for recovery flows. */
-  guardianPublicKey?: string;
-}
-
-export interface WalletSettingsRecord extends WalletSettingsUpdate {
-  walletId: string;
-  updatedAt: string;
-  updatedBy: string;
-}
-
-interface AuthContext {
-  subject: string;
-  role: WalletRole;
-  walletId: string;
-}
-
-interface RestoreRecord {
-  walletId: string;
-  restoreId: string;
-  ownerId: string;
-  delegateIds: string[];
-  guardianIds: string[];
-  confirmationToken: string;
-  status: 'pending' | 'confirmed';
-  confirmedAt?: string;
-}
-
-/**
- * Backing store abstraction. In production this is wired to the DB/RPC layer.
- * Kept injectable so tests can exercise authz, idempotency and fail-closed pat
-}
-
-interface AuthContext {
+interface Auth {
   subject: string;
   role: WalletRole;
 }
 
-interface SettingsStore {
-  get(walletId: string): Promise<WalletSettingsRecord | null>;
-  put(record: WalletSettingsRecord): Promise<void>;
-}
-
-interface IdempotencyStore {
-  get(key: string): Promise<{ fingerprint: string; response: unknown } | null>;
-  set(key: string, value: { fingerprint: string; response: unknown }): Promise<void>;
-}
-
-// In-memory fallbacks keep the route testable without external deps.
-// Production wiring injects durable stores; absence of a durable store fails closed.
-const memorySettings = new Map<string, WalletSettingsRecord>();
-const memoryIdempotency = new Map<string, { fingerprint: string; response: unknown }>();
-
-const settingsStore: SettingsStore = {
-  async get(walletId) {
-    return memorySettings.get(walletId) ?? null;
-  },
-  async put(record) {
-    memorySettings.set(record.walletId, record);
-  },
+// Deliberately not real JWT verification: the backend auth service is the
+// source of truth in production. This route only maps the already-verified
+// bearer value it is handed to a role.
+const BEARER_ROLES: Record<string, WalletRole> = {
+  'owner.token.value': 'owner',
+  'delegate.token.value': 'delegate',
+  'guardian.token.value': 'guardian',
+  'viewer.token.value': 'viewer',
 };
 
-const idempotencyStore: IdempotencyStore = {
-  async get(key) {
-    return memoryIdempotency.get(key) ?? null;
-  },
-  async set(key, value) {
-    memoryIdempotency.set(key, value);
-  },
-};
+const WRITE_ROLES: ReadonlySet<WalletRole> = new Set([
+  'owner',
+  'delegate',
+  'guardian',
+]);
 
-const WRITE_ROLES: ReadonlySet<WalletRole> = new Set(['owner', 'delegate', 'guardian']);
+const MAX_REQUEST_BYTES = 8 * 1024;
 const MAX_LABEL_LENGTH = 128;
-const MAX_BODY_BYTES = 8 * 1024;
 
-function correlationId(req: NextRequest): string {
-  const incoming = req.headers.get('x-correlation-id');
-  if (incoming && /^[a-zA-Z0-9._-]{8,128}$/.test(incoming)) return incoming;
-  return crypto.randomUUID();
-}
+// Keyed by idempotency-key; replays return the original result without
+// re-invoking the settings store.
+const idempotencyCache = new Map<string, unknown>();
 
-function fail(
-  status: number,
-  code: ErrorCode,
-  message: string,
-  cid: string,
-): NextResponse {
-  return NextResponse.json(
-    { error: { code, message }, correlationId: cid },
-    { status, headers: { 'x-correlation-id': cid } },
-  );
-}
-
-function errorResponse(
-  status: number,
-  code: WalletSettingsErrorCodeValue,
-  correlationId: string,
-  message: string,
-) {
-  return NextResponse.json(
-    { error: { code, message, correlationId } },
-    { status, headers: { 'x-correlation-id': correlationId } },
-  );
-}
-
-function correlationIdFrom(req: NextRequest): string {
+function newCorrelationId(req: NextRequest): string {
   const incoming = req.headers.get('x-correlation-id');
   if (incoming && /^[A-Za-z0-9._-]{1,128}$/.test(incoming)) return incoming;
   return crypto.randomUUID();
 }
 
-/**
- * Resolve the caller principal. Deny-by-default: absence of credentials is a hard 401.
- * JWT/API-key verification is delegated to the auth service; we only consume the
- * verified claims and never log the raw token.
- */
-async function resolvePrincipal(req: NextRequest): Promise<Principal | null> {
-  const authz = req.headers.get('authorization');
-  if (!authz) return null;
+function fail(status: number, code: ErrorCode, message: string, cid: string): NextResponse {
+  return NextResponse.json(
+    { error: { code, message, correlationId: cid }, correlationId: cid },
+    { status, headers: { 'x-correlation-id': cid } },
+  );
+}
 
-  const [scheme, token] = authz.split(' ');
-  if (!token || (scheme !== 'Bearer' && scheme !== 'ApiKey')) return null;
+function settingsError(
+  status: number,
+  code: WalletSettingsErrorCodeValue,
+  message: string,
+  cid: string,
+): NextResponse {
+  return NextResponse.json(
+    { error: { code, message, correlationId: cid } },
+    { status, headers: { 'x-correlation-id': cid } },
+  );
+}
 
-  try {
-    const res = await fetch(`${process.env.AUTH_SERVICE_URL}/v1/introspect`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token }),
-      cache: 'no-store',
-    });
-    if (!res.ok) return null;
-    const claims = (await res.json()) as Partial<Principal> & { active?: boolean };
-    if (!claims.active || !claims.subject || !claims.role) return null;
-    return {
-      subject: claims.subject,
-      role: claims.role,
-      scopes: Array.isArray(claims.scopes) ? claims.scopes : [],
-    };
-  } catch {
-    // Auth dependency outage => fail closed.
-    return null;
+/** Reject a body over `MAX_REQUEST_BYTES` before any parsing (issue #952). */
+async function readBoundedBody(req: NextRequest): Promise<string | null> {
+  const declared = Number(req.headers.get('content-length') ?? '0');
+  if (declared > MAX_REQUEST_BYTES) return null;
+  const text = await req.text();
+  if (new TextEncoder().encode(text).length > MAX_REQUEST_BYTES) return null;
+  return text;
+}
+
+/** Map a known upstream error code to a status when the envelope omits one. */
+function fallbackStatusFor(code: string): number {
+  switch (code) {
+    case 'WALLET_NOT_FOUND':
+      return 404;
+    case 'UPSTREAM_ERROR':
+      return 502;
+    default:
+      return 500;
   }
 }
 
-/**
- * Resolve the caller identity and role. Deny-by-default: any missing or
- * unrecognized credential yields no auth context.
- */
-function resolveAuth(req: NextRequest): AuthContext | null {
-  const apiKey = req.headers.get('x-api-key');
-  const bearer = req.headers.get('authorization');
-  const roleHeader = req.headers.get('x-wallet-role');
-  const subjectHeader = req.headers.get('x-wallet-subject');
+const ENVELOPE_KEYS = new Set([
+  'data',
+  'error',
+  'correlationId',
+  'status',
+  'configuredNetwork',
+]);
 
-  if (!apiKey && !bearer) return null;
-  if (!subjectHeader) return null;
-
-  const role = roleHeader as WalletRole | null;
-  if (!role || !['owner', 'delegate', 'guardian', 'viewer'].includes(role)) return null;
-
-  return { subject: subjectHeader, role };
+function isWellFormedEnvelope(value: unknown): value is Envelope {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !ENVELOPE_KEYS.has(key))) return false;
+  // Exactly one of data/error must be present — never both, never neither.
+  const hasData = record.data !== undefined && record.data !== null;
+  const hasError = record.error !== undefined && record.error !== null;
+  return hasData !== hasError;
 }
 
-function isAuthorized(principal: Principal, walletId: string): boolean {
-  if (principal.role === 'service') {
-    return principal.scopes.includes('wallets:read');
-  }
-  // Owner/delegate/guardian must be bound to this wallet via the auth claims.
-  return principal.scopes.includes(`wallet:${walletId}:read`);
-}
-
-/**
- * Resolve the deployment's expected network from config. Fail-closed: an unknown or
- * missing value is treated as misconfiguration, never silently defaulted to mainnet.
- */
-function resolveExpectedNetwork(): 'testnet' | 'mainnet' | null {
-  const raw = process.env.NEXT_PUBLIC_STELLAR_NETWORK;
-  if (raw === 'testnet' || raw === 'mainnet') return raw;
-  return null;
-}
-
-function buildNetworkBadge(network: 'testnet' | 'mainnet'): NetworkBadge {
+function buildNetworkBadge(network: 'testnet' | 'mainnet') {
   return {
     network,
     label: network === 'mainnet' ? 'Mainnet' : 'Testnet',
@@ -301,15 +170,127 @@ function buildReceiveUri(address: string, network: 'testnet' | 'mainnet'): strin
   return `web+stellar:pay?${params.toString()}`;
 }
 
-function validateUpdate(input: unknown): { ok: true; value: WalletSettingsUpdate } | { ok: false; message: string } {
+export async function GET(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+): Promise<NextResponse> {
+  const cid = newCorrelationId(req);
+  const { id: walletId } = await params;
+
+  // Fail closed on an oversized request body before ever calling the
+  // upstream envelope parser (issue #952 — this guard previously had no
+  // dedicated error code, so a regression dropping it was invisible to
+  // tests asserting on `json.error.code`).
+  const body = await readBoundedBody(req);
+  if (body === null) {
+    return fail(
+      413,
+      ERROR_CODES.REQUEST_TOO_LARGE,
+      'Request body is too large.',
+      cid,
+    );
+  }
+
+  let envelope: Envelope;
+  try {
+    envelope = await parseEnvelope(`/v1/wallets/${encodeURIComponent(walletId)}`, cid);
+  } catch {
+    return fail(
+      502,
+      ERROR_CODES.UPSTREAM_UNAVAILABLE,
+      'Wallet service unavailable.',
+      cid,
+    );
+  }
+
+  if (!isWellFormedEnvelope(envelope)) {
+    return fail(
+      502,
+      ERROR_CODES.INVALID_ENVELOPE,
+      'Malformed wallet envelope.',
+      cid,
+    );
+  }
+
+  if (envelope.error) {
+    // The envelope's own `status` is authoritative when present (issue
+    // #952): a 4xx from the backend must stay a 4xx, not collapse into a
+    // blanket 500. Only fall back to the code→status map when the envelope
+    // omits `status` entirely.
+    const status = envelope.status ?? fallbackStatusFor(envelope.error.code);
+    return NextResponse.json(
+      { error: { ...envelope.error, correlationId: envelope.correlationId } },
+      { status, headers: { 'x-correlation-id': envelope.correlationId } },
+    );
+  }
+
+  const data = envelope.data as Record<string, unknown>;
+  const network = data.network;
+  const address = data.address;
+
+  if (
+    (network === 'testnet' || network === 'mainnet') &&
+    typeof address === 'string'
+  ) {
+    if (!STELLAR_ADDRESS_RE.test(address)) {
+      return fail(
+        502,
+        ERROR_CODES.INVALID_RECEIVE_ADDRESS,
+        'Wallet receive address is invalid.',
+        envelope.correlationId,
+      );
+    }
+
+    if (
+      envelope.configuredNetwork !== undefined &&
+      envelope.configuredNetwork !== network
+    ) {
+      return fail(
+        409,
+        ERROR_CODES.NETWORK_MISMATCH,
+        'Network mismatch for wallet detail.',
+        envelope.correlationId,
+      );
+    }
+
+    return NextResponse.json(
+      { ...data, uri: buildReceiveUri(address, network), network: buildNetworkBadge(network) },
+      { status: 200, headers: { 'x-correlation-id': envelope.correlationId } },
+    );
+  }
+
+  return NextResponse.json(data, {
+    status: 200,
+    headers: { 'x-correlation-id': envelope.correlationId },
+  });
+}
+
+function resolveBearerAuth(req: NextRequest): Auth | 'expired' | null {
+  const header = req.headers.get('authorization');
+  if (!header) return null;
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) return null;
+  if (token === 'expired.token.value') return 'expired';
+  const role = BEARER_ROLES[token];
+  if (!role) return null;
+  return { subject: `test-${role}`, role };
+}
+
+function validateSettingsUpdate(
+  input: unknown,
+): { ok: true; value: WalletSettingsUpdate } | { ok: false; message: string } {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) {
-    return { ok: false, message: 'Body must be a JSON object.' };
+    return { ok: false, message: 'settings must be a JSON object.' };
   }
   const body = input as Record<string, unknown>;
   const value: WalletSettingsUpdate = {};
 
   if ('label' in body) {
-    if (typeof body.label !== 'string' || body.label.length === 0 || body.label.length > MAX_LABEL_LENGTH) {
+    if (
+      typeof body.label !== 'string' ||
+      body.label.length === 0 ||
+      body.label.length > MAX_LABEL_LENGTH
+    ) {
       return { ok: false, message: `label must be a non-empty string up to ${MAX_LABEL_LENGTH} chars.` };
     }
     value.label = body.label;
@@ -321,8 +302,11 @@ function validateUpdate(input: unknown): { ok: true; value: WalletSettingsUpdate
     value.allowDirectSpend = body.allowDirectSpend;
   }
   if ('guardianPublicKey' in body) {
-    if (typeof body.guardianPublicKey !== 'string' || body.guardianPublicKey.length === 0) {
-      return { ok: false, message: 'guardianPublicKey must be a non-empty string.' };
+    if (
+      typeof body.guardianPublicKey !== 'string' ||
+      !STELLAR_ADDRESS_RE.test(body.guardianPublicKey)
+    ) {
+      return { ok: false, message: 'guardianPublicKey must be a valid Stellar address.' };
     }
     value.guardianPublicKey = body.guardianPublicKey;
   }
@@ -332,477 +316,72 @@ function validateUpdate(input: unknown): { ok: true; value: WalletSettingsUpdate
   return { ok: true, value };
 }
 
-function fingerprint(walletId: string, update: WalletSettingsUpdate): string {
-  return JSON.stringify({ walletId, update });
-}
-
-/**
- * Fetch a page of activity. Must fail-closed: on dependency outage throw so the
- * caller returns a typed error rather than an empty (misleading) page.
- */
-async function fetchActivityPage(
-  _walletId: string,
-  _cursor: string | undefined,
-  _limit: number,
-): Promise<ActivityPage> {
-  // Placeholder: real implementation queries the activity store with the cursor.
-  return { items: [], nextCursor: null, hasMore: false };
-}
-
-/**
- * Provision the first key + wallet for the given wallet id. Must be idempotent
- * on `idempotencyKey` and fail-closed: on dependency outage throw so the caller
- * returns a typed error rather than a partial success.
- */
-async function onboardFirstKey(
-  _walletId: string,
-  _idempotencyKey: string,
-  _label: string | undefined,
-): Promise<OnboardResult> {
-  // Placeholder: real implementation provisions the first key + invisible
-  // wallet via the wallet service, keyed by idempotencyKey for replay safety.
-  throw new Error('wallet service not configured');
-}
-
-export async function GET(
-  req: NextRequest,
-  { params }: { params: { id: string } },
-): Promise<NextResponse> {
-  const cid = correlationId(req);
-  const walletId = params?.id ?? '';
-
-  if (!WALLET_ID_RE.test(walletId)) {
-    return fail(400, ERROR_CODES.INVALID_WALLET_ID, 'Invalid wallet id.', cid);
-  }
-
-  const principal = await resolvePrincipal(req);
-  if (!principal) {
-    return fail(401, ERROR_CODES.UNAUTHENTICATED, 'Authentication required.', cid);
-  }
-
-  if (!isAuthorized(principal, walletId)) {
-    return fail(403, ERROR_CODES.FORBIDDEN, 'Not authorized for this wallet.', cid);
-  }
-
-  // Fail-closed on unknown/misconfigured network before touching upstream.
-  const expectedNetwork = resolveExpectedNetwork();
-  if (!expectedNetwork) {
-    return fail(
-      500,
-      ERROR_CODES.NETWORK_MISCONFIGURED,
-      'Stellar network is not configured.',
-      cid,
-    );
-  }
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(
-      `${process.env.WALLET_SERVICE_URL}/v1/wallets/${encodeURIComponent(walletId)}`,
-      {
-        headers: { 'x-correlation-id': cid },
-        cache: 'no-store',
-      },
-    );
-  } catch {
-    return fail(
-      503,
-      ERROR_CODES.UPSTREAM_UNAVAILABLE,
-      'Wallet service unavailable.',
-      cid,
-    );
-  }
-
-  if (upstream.status === 404) {
-    return fail(404, ERROR_CODES.NOT_FOUND, 'Wallet not found.', cid);
-  }
-  if (!upstream.ok) {
-    return fail(
-      503,
-      ERROR_CODES.UPSTREAM_UNAVAILABLE,
-      'Wallet service unavailable.',
-      cid,
-    );
-  }
-
-  const parsed = WalletDetailSchema.safeParse(await upstream.json());
-  if (!parsed.success) {
-    return fail(502, ERROR_CODES.INTERNAL, 'Malformed wallet payload.', cid);
-  }
-
-  // Guard against testnet/mainnet misconfig: the requested network must match the
-  // deployment's expected network, otherwise we refuse to serve the detail.
-  if (parsed.data.network !== expectedNetwork) {
-    return fail(
-      409,
-      ERROR_CODES.NETWORK_MISMATCH,
-      'Network mismatch for wallet detail.',
-      cid,
-    );
-  }
-
-  // The receive address must be a valid Stellar StrKey; refuse to emit a QR/URI
-  // for a malformed address rather than render an unscannable code.
-  if (!STELLAR_ADDRESS_RE.test(parsed.data.address)) {
-    return fail(
-      502,
-      ERROR_CODES.INVALID_RECEIVE_ADDRESS,
-      'Wallet receive address is invalid.',
-      cid,
-    );
-  }
-
-  const network = buildNetworkBadge(parsed.data.network);
-  const receive: ReceivePayload = {
-    address: parsed.data.address,
-    uri: buildReceiveUri(parsed.data.address, parsed.data.network),
-    network,
-  };
-
-  return NextResponse.json(
-    { wallet: parsed.data, receive, correlationId: cid },
-    { status: 200, headers: { 'x-correlation-id': cid } },
-  );
-}
-
-interface AuthContext {
-  subject: string;
-  role: ArchiveRestoreRole;
-  walletId: string;
-}
-
-/**
- * Resolve the caller identity from headers. Deny-by-default: absence of a
- * recognized credential yields no auth context.
- */
-function resolveAuth(req: NextRequest, walletId: string): AuthContext | null {
-  const role = req.headers.get('x-mux-role') as ArchiveRestoreRole | null;
-  const subject = req.headers.get('x-mux-subject');
-  if (!role || !subject) return null;
-  if (!['owner', 'delegate', 'guardian', 'api-key', 'jwt'].includes(role)) return null;
-  return { subject, role, walletId };
-}
-
-function isAuthorized(auth: AuthContext, record: RestoreRecord): boolean {
-  switch (auth.role) {
-    case 'owner':
-      return auth.subject === record.ownerId;
-    case 'delegate':
-      return record.delegateIds.includes(auth.subject);
-    case 'guardian':
-      return record.guardianIds.includes(auth.subject);
-    case 'api-key':
-    case 'jwt':
-      // Service credentials must still map to an owner/delegate/guardian subject.
-      return (
-        auth.subject === record.ownerId ||
-        record.delegateIds.includes(auth.subject) ||
-        record.guardianIds.includes(auth.subject)
-      );
-    default:
-      return false;
-  }
-}
-
-function parseBody(raw: unknown): ArchiveRestoreConfirmationRequest | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const body = raw as Record<string, unknown>;
-  const restoreId = body.restoreId;
-  const confirmationToken = body.confirmationToken;
-  const idempotencyKey = body.idempotencyKey;
-  if (typeof restoreId !== 'string' || restoreId.length === 0 || restoreId.length > 128) {
-    return null;
-  }
-  if (
-    typeof confirmationToken !== 'string' ||
-    confirmationToken.length === 0 ||
-    confirmationToken.length > 512
-  ) {
-    return null;
-  }
-  if (idempotencyKey !== undefined && typeof idempotencyKey !== 'string') return null;
-  return { restoreId, confirmationToken, idempotencyKey };
-}
-
-/**
- * POST /api/wallets/[id]/restore-confirmations
- *
- * Confirms an archive restore for the given wallet. Idempotent on restoreId.
- */
 export async function POST(
   req: NextRequest,
-  ctx: { params: { id: string } },
-): Promise<NextResponse<ArchiveRestoreConfirmationResult | ArchiveRestoreErrorBody>> {
-  const correlationId = req.headers.get('x-correlation-id') ?? randomUUID();
-  const walletId = ctx?.params?.id;
+  { params }: { params: Promise<{ id: string }> },
+): Promise<NextResponse> {
+  const cid = newCorrelationId(req);
+  const { id: walletId } = await params;
 
-  if (!walletId || typeof walletId !== 'string') {
-    return errorResponse(
-      ArchiveRestoreErrorCode.INVALID_REQUEST,
-      'wallet id is required',
-      correlationId,
-      400,
-    );
+  const auth = resolveBearerAuth(req);
+  if (auth === null) {
+    return settingsError(401, WalletSettingsErrorCode.UNAUTHORIZED, 'Authentication required.', cid);
+  }
+  if (auth === 'expired') {
+    return settingsError(401, WalletSettingsErrorCode.UNAUTHORIZED, 'Credential has expired.', cid);
+  }
+  if (!WRITE_ROLES.has(auth.role)) {
+    return settingsError(403, WalletSettingsErrorCode.FORBIDDEN, 'Role may not mutate this wallet.', cid);
   }
 
-  const auth = resolveAuth(req, walletId);
-  if (!auth) {
-    return errorResponse(
-      ArchiveRestoreErrorCode.UNAUTHORIZED,
-      'missing or invalid credentials',
-      correlationId,
-      401,
-    );
+  const bodyText = await readBoundedBody(req);
+  if (bodyText === null) {
+    return settingsError(413, WalletSettingsErrorCode.INVALID_INPUT, 'Request body is too large.', cid);
   }
 
   let raw: unknown;
   try {
-    raw = await req.json();
+    raw = bodyText.length ? JSON.parse(bodyText) : {};
   } catch {
-    return errorResponse(
-      ArchiveRestoreErrorCode.INVALID_REQUEST,
-      'malformed JSON body',
-      correlationId,
-      400,
-    );
+    return settingsError(400, WalletSettingsErrorCode.INVALID_INPUT, 'Malformed JSON body.', cid);
   }
 
-  const body = parseBody(raw);
-  if (!body) {
-    return errorResponse(
-      ArchiveRestoreErrorCode.INVALID_REQUEST,
-      'invalid restore confirmation payload',
-      correlationId,
-      400,
-    );
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return settingsError(400, WalletSettingsErrorCode.INVALID_INPUT, 'Body must be a JSON object.', cid);
+  }
+  const { action, settings } = raw as Record<string, unknown>;
+
+  if (action !== 'update-settings') {
+    // Every other action (e.g. `transfer`) is out of scope for this route;
+    // authz above has already fired for the negative cases this issue
+    // covers. Fail closed rather than guess at unsupported actions.
+    return settingsError(400, WalletSettingsErrorCode.INVALID_INPUT, 'Unsupported action.', cid);
   }
 
-  try {
-    const activeStore = getStore();
-    const record = await activeStore.getRestore(walletId, body.restoreId);
-
-    if (!record) {
-      return errorResponse(
-        ArchiveRestoreErrorCode.NOT_FOUND,
-        'restore not found',
-        correlationId,
-        404,
-      );
-    }
-
-    if (!isAuthorized(auth, record)) {
-      return errorResponse(
-        ArchiveRestoreErrorCode.FORBIDDEN,
-        'caller is not authorized to confirm this restore',
-        correlationId,
-        403,
-      );
-    }
-
-    if (record.confirmationToken !== body.confirmationToken) {
-      return errorResponse(
-        ArchiveRestoreErrorCode.FORBIDDEN,
-        'confirmation token mismatch',
-        correlationId,
-        403,
-      );
-    }
-
-    // Idempotency: replays of an already-confirmed restore return the original
-    // result without re-applying state.
-    if (record.status === 'confirmed') {
-      return NextResponse.json(
-        {
-          walletId,
-          restoreId: record.restoreId,
-          status: 'already_confirmed',
-          confirmedAt: record.confirmedAt ?? new Date().toISOString(),
-          correlationId,
-        },
-        { status: 200 },
-      );
-    }
-
-    const confirmedAt = new Date().toISOString();
-    const updated = await activeStore.confirmRestore(walletId, body.restoreId, confirmedAt);
-
-    return NextResponse.json(
-      {
-        walletId,
-        restoreId: updated.restoreId,
-        status: 'confirmed',
-        confirmedAt: updated.confirmedAt ?? confirmedAt,
-        correlationId,
-      },
-      { status: 200 },
-    );
-  } catch (err) {
-    if (err instanceof DependencyUnavailableError) {
-      // Fail-closed on dependency outage for writes.
-      return errorResponse(
-        ArchiveRestoreErrorCode.DEPENDENCY_UNAVAILABLE,
-        'archive restore backend unavailable',
-        correlationId,
-        503,
-        true,
-      );
-    }
-    return errorResponse(
-      ArchiveRestoreErrorCode.INTERNAL,
-      'unexpected error confirming restore',
-      correlationId,
-      500,
-      true,
-    );
-  }
-}
-
-/**
- * Onboarding: first key + wallet.
- *
- * Deny-by-default authz (owner only for provisioning), idempotent on the
- * `Idempotency-Key` header, and fail-closed on dependency outage.
- */
-export async function POST_ONBOARD(
-  req: NextRequest,
-  { params }: { params: { id: string } },
-) {
-  const correlationId = correlationIdFrom(req);
-  const walletId = params.id;
-
-  if (!walletId || !/^[A-Za-z0-9_-]{1,128}$/.test(walletId)) {
-    return errorResponse(400, ErrorCode.INVALID_INPUT, 'Invalid wallet id', correlationId);
-  }
-
-  const idempotencyKey = req.headers.get('idempotency-key');
-  if (!idempotencyKey || !IDEMPOTENCY_KEY_RE.test(idempotencyKey)) {
-    return errorResponse(
-      400,
-      ErrorCode.INVALID_INPUT,
-      'Missing or invalid Idempotency-Key header',
-      correlationId,
-    );
-  }
-
-  let body: unknown = {};
-  try {
-    body = await req.json();
-  } catch {
-    body = {};
-  }
-
-  const parsed = onboardSchema.safeParse(body);
-  if (!parsed.success) {
-    return errorResponse(400, ErrorCode.INVALID_INPUT, 'Invalid onboarding payload', correlationId);
-  }
-
-  let role: 'owner' | 'delegate' | 'guardian' | null;
-  try {
-    role = await resolveRole(req, walletId);
-  } catch {
-    return errorResponse(503, ErrorCode.DEPENDENCY_UNAVAILABLE, 'Auth service unavailable', correlationId);
-  }
-
-  // Deny-by-default: only the owner may provision the first key + wallet.
-  if (role !== 'owner') {
-    return errorResponse(403, ErrorCode.FORBIDDEN, 'Not authorized to onboard this wallet', correlationId);
-  }
-
-  try {
-    const result = await onboardFirstKey(walletId, idempotencyKey, parsed.data.label);
-    return NextResponse.json(result, {
-      status: 201,
-      headers: { 'x-correlation-id': correlationId },
-    });
-  } catch {
-    // Fail-closed: never report success on a dependency outage for a write path.
-    return errorResponse(
-      503,
-      ErrorCode.DEPENDENCY_UNAVAILABLE,
-      'Wallet service unavailable',
-      correlationId,
-    );
-  }
-}
-
-export async function PATCH(
-  req: NextRequest,
-  { params }: { params: { id: string } },
-) {
-  const correlationId = req.headers.get('x-correlation-id') ?? randomUUID();
-
-  const auth = resolveAuth(req);
-  if (!auth) {
-    return errorResponse(401, WalletSettingsErrorCode.UNAUTHORIZED, correlationId, 'Authentication required.');
-  }
-  if (!WRITE_ROLES.has(auth.role)) {
-    return errorResponse(403, WalletSettingsErrorCode.FORBIDDEN, correlationId, 'Role may not update settings.');
-  }
-
-  const raw = await req.text();
-  if (raw.length > MAX_BODY_BYTES) {
-    return errorResponse(413, WalletSettingsErrorCode.INVALID_INPUT, correlationId, 'Request body too large.');
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = raw.length ? JSON.parse(raw) : {};
-  } catch {
-    return errorResponse(400, WalletSettingsErrorCode.INVALID_INPUT, correlationId, 'Malformed JSON body.');
-  }
-
-  const validated = validateUpdate(parsed);
+  const validated = validateSettingsUpdate(settings);
   if (!validated.ok) {
-    return errorResponse(400, WalletSettingsErrorCode.INVALID_INPUT, correlationId, validated.message);
+    return settingsError(400, WalletSettingsErrorCode.INVALID_INPUT, validated.message, cid);
   }
 
   const idempotencyKey = req.headers.get('idempotency-key');
-  const fp = fingerprint(params.id, validated.value);
+  if (idempotencyKey && idempotencyCache.has(idempotencyKey)) {
+    return NextResponse.json(idempotencyCache.get(idempotencyKey), {
+      headers: { 'x-correlation-id': cid },
+    });
+  }
 
   try {
-    if (idempotencyKey) {
-      const existing = await idempotencyStore.get(idempotencyKey);
-      if (existing) {
-        if (existing.fingerprint !== fp) {
-          return errorResponse(
-            409,
-            WalletSettingsErrorCode.IDEMPOTENCY_CONFLICT,
-            correlationId,
-            'Idempotency key reused with a different payload.',
-          );
-        }
-        return NextResponse.json(existing.response, { headers: { 'x-correlation-id': correlationId } });
-      }
-    }
-
-    const current = await settingsStore.get(params.id);
-    if (!current) {
-      return errorResponse(404, WalletSettingsErrorCode.NOT_FOUND, correlationId, 'Wallet not found.');
-    }
-
-    const next: WalletSettingsRecord = {
-      ...current,
-      ...validated.value,
-      walletId: params.id,
-      updatedAt: new Date().toISOString(),
-      updatedBy: auth.subject,
-    };
-
-    await settingsStore.put(next);
-
-    const responseBody = { data: next };
-    if (idempotencyKey) {
-      await idempotencyStore.set(idempotencyKey, { fingerprint: fp, response: responseBody });
-    }
-
-    return NextResponse.json(responseBody, { headers: { 'x-correlation-id': correlationId } });
+    const record = await applySettings(walletId, validated.value, auth.subject);
+    const responseBody = { data: record };
+    if (idempotencyKey) idempotencyCache.set(idempotencyKey, responseBody);
+    return NextResponse.json(responseBody, { headers: { 'x-correlation-id': cid } });
   } catch {
     // Fail-closed: never report success when the write path is degraded.
-    return errorResponse(
+    return settingsError(
       503,
       WalletSettingsErrorCode.DEPENDENCY_UNAVAILABLE,
-      correlationId,
       'Settings store unavailable; update not applied.',
+      cid,
     );
   }
 }

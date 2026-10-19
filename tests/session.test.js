@@ -96,6 +96,28 @@ const testnetCookie = buildSessionCookie(session.accessToken, {
 });
 assert.ok(!testnetCookie.includes("Secure"));
 
+// Default (no `secure` key at all) must fail closed: the most common call
+// shape -- a caller that forgot the option entirely -- must still get a
+// Secure cookie, not silently fall back to an insecure one.
+const defaultSecureCookie = buildSessionCookie(session.accessToken, {
+	expiresAt: session.expiresAt,
+});
+assert.ok(
+	defaultSecureCookie.includes("Secure"),
+	"buildSessionCookie must default to Secure when `secure` is omitted",
+);
+
+// SESSION_COOKIE_ATTRIBUTES is the single source of truth: both the set
+// and clear cookies must reflect the exact same path/sameSite values, not
+// independently hardcoded copies.
+for (const cookie of [defaultSecureCookie, buildClearSessionCookie()]) {
+	assert.ok(cookie.includes(`Path=${SESSION_COOKIE_ATTRIBUTES.path}`));
+	assert.ok(cookie.includes(`SameSite=${SESSION_COOKIE_ATTRIBUTES.sameSite}`));
+	if (SESSION_COOKIE_ATTRIBUTES.httpOnly) {
+		assert.ok(cookie.includes("HttpOnly"));
+	}
+}
+
 // Server-side read: parse + validate fail-closed with stable error codes.
 const parsed = parseSessionCookie(setCookie);
 assert.strictEqual(parsed.name, SESSION_COOKIE_NAME);
@@ -114,6 +136,12 @@ assert.strictEqual(missing.error, "SESSION_MISSING");
 const malformed = validateSessionCookie("not-a-cookie", { now: Date.now() });
 assert.strictEqual(malformed.ok, false);
 assert.strictEqual(malformed.error, "SESSION_MALFORMED");
+
+// parseSessionCookie fails closed on malformed input: never a partial
+// object, never a throw -- just `null` for each of these shapes.
+assert.strictEqual(parseSessionCookie("not-a-cookie"), null);
+assert.strictEqual(parseSessionCookie("=value"), null);
+assert.strictEqual(parseSessionCookie("name="), null);
 
 // Expired cookie -> rejected.
 const expiredCookie = buildSessionCookie(session.accessToken, {

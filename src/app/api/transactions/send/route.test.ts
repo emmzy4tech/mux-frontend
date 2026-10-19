@@ -190,6 +190,8 @@ describe("POST /api/transactions/send — input validation", () => {
 		["bad asset", { ...VALID_BODY, asset: "USDC" }],
 		["long memo", { ...VALID_BODY, memo: "m".repeat(29) }],
 		["array", [VALID_BODY]],
+		["over-long network", { ...VALID_BODY, network: "n".repeat(33) }],
+		["invalid-character network", { ...VALID_BODY, network: "test net!" }],
 	])("rejects %s", async (_label, body) => {
 		const POST = await loadPost();
 		const res = await POST(sendRequest(body));
@@ -198,10 +200,24 @@ describe("POST /api/transactions/send — input validation", () => {
 		expect(upstream).not.toHaveBeenCalled();
 	});
 
-	it("rejects oversized bodies", async () => {
+	it("rejects oversized bodies before calling upstream", async () => {
 		const POST = await loadPost();
 		const res = await POST(sendRequest("x".repeat(5_000)));
 		expect(res.status).toBe(413);
+		expect(await errorCode(res)).toBe("SEND_INVALID_INPUT");
+		expect(upstream).not.toHaveBeenCalled();
+	});
+
+	it("rejects a body over the byte cap even when content-length lies", async () => {
+		// A short/absent content-length header must not bypass the guard: the
+		// route also measures the actual decoded body.
+		const POST = await loadPost();
+		const res = await POST(
+			sendRequest("x".repeat(5_000), { "content-length": "1" }),
+		);
+		expect(res.status).toBe(413);
+		expect(await errorCode(res)).toBe("SEND_INVALID_INPUT");
+		expect(upstream).not.toHaveBeenCalled();
 	});
 });
 

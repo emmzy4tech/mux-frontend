@@ -111,4 +111,35 @@ describe("useRetryCountdown", () => {
 
 		expect(vi.getTimerCount()).toBe(0);
 	});
+
+	it("does not schedule an interval when retryAt is already in the past", () => {
+		clockMs = START + 1_000;
+		renderHook(() => useRetryCountdown(START + 500, now));
+
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("reports ready immediately when retryAt is already in the past", () => {
+		clockMs = START + 1_000;
+		const { result } = renderHook(() => useRetryCountdown(START + 500, now));
+
+		expect(result.current.ready).toBe(true);
+		expect(result.current.remainingMs).toBe(0);
+	});
+
+	it("clears the outstanding interval when retryAt transitions to null", () => {
+		const { result, rerender } = renderHook(
+			({ retryAt }: { retryAt: number | null }) =>
+				useRetryCountdown(retryAt, now),
+			{ initialProps: { retryAt: START + 1_000 } },
+		);
+
+		expect(vi.getTimerCount()).toBe(1);
+
+		rerender({ retryAt: null });
+
+		expect(vi.getTimerCount()).toBe(0);
+		expect(result.current.ready).toBe(true);
+		expect(result.current.remainingMs).toBe(0);
+	});
 });

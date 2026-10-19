@@ -83,7 +83,7 @@ test.describe("Login against a real mux-backend", () => {
 			code?: string;
 			correlationId?: string;
 		};
-		expect(body.code).toBe(LOGIN_ERROR_CODES.AUTH_INVALID_CREDENTIALS);
+		expect(body.code).toBe(LOGIN_ERROR_CODES.invalidCredentials);
 
 		// Correlation id must be present on the response header (or body) so
 		// ops can trace the failure without the request body (which holds
@@ -112,7 +112,7 @@ test.describe("Login against a real mux-backend", () => {
 		expect(response.status()).toBe(400);
 
 		const body = (await response.json()) as { code?: string };
-		expect(body.code).toBe(LOGIN_ERROR_CODES.AUTH_MISSING_CREDENTIALS);
+		expect(body.code).toBe(LOGIN_ERROR_CODES.missingCredentials);
 		await expect(page).not.toHaveURL(/\/dashboard/);
 	});
 
