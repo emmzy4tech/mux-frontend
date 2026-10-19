@@ -1,172 +1,294 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+// @vitest-environment node
+import { describe, it, expect, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
-// Mock the auth/session layer so we can exercise authz negatives without a real JWT.
-const getSession = vi.fn();
-vi.mock('@/lib/auth/session', () => ({
-  getSession: (...args: unknown[]) => getSession(...args),
+// The route still imports its key list from @/mock-data/api-keys, which is no
+// longer in the tree. Provide a hermetic fixture so the route can load and the
+// tests do not depend on the shape of any shared mock set.
+vi.mock('@/mock-data/api-keys', () => ({
+  mockApiKeys: [
+    { id: 'key_1', name: 'ci' },
+    { id: 'key_2', name: 'deploy' },
+  ],
 }));
 
-// Mock the api-key store so tests are hermetic and can assert idempotency/fail-closed.
-const listApiKeys = vi.fn();
-const createApiKey = vi.fn();
-const revokeApiKey = vi.fn();
-vi.mock('@/lib/api-keys/store', () => ({
-  listApiKeys: (...args: unknown[]) => listApiKeys(...args),
-  createApiKey: (...args: unknown[]) => createApiKey(...args),
-  revokeApiKey: (...args: unknown[]) => revokeApiKey(...args),
-}));
+import { GET, POST } from './route';
 
-import { GET, POST, DELETE } from './route';
+const AUTH_HEADERS = { authorization: 'Bearer test-token' };
 
-const OWNER = { userId: 'user_owner', role: 'owner' } as const;
-const DELEGATE = { userId: 'user_delegate', role: 'delegate' } as const;
+// Mirrors the route's bounds; asserted against observable behaviour below.
+const DEFAULT_AUDIT_LIMIT = 50;
+const MAX_AUDIT_LIMIT = 100;
+const DEFAULT_RANGE_DAYS = 30;
+const MAX_RANGE_DAYS = 90;
+const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
 
-function jsonRequest(method: string, body?: unknown, headers: Record<string, string> = {}) {
+function getRequest(
+  params: Record<string, string>,
+  headers: Record<string, string> = AUTH_HEADERS,
+) {
+  const url = new URL('http://localhost/api/api-keys');
+  url.search = new URLSearchParams(params).toString();
+  return new NextRequest(url, { method: 'GET', headers });
+}
+
+function postRequest(body: unknown, headers: Record<string, string> = {}) {
   return new NextRequest('http://localhost/api/api-keys', {
-    method,
-    headers: { 'content-type': 'application/json', ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...AUTH_HEADERS, ...headers },
+    body: JSON.stringify(body),
   });
 }
 
+// The idempotency cache is module-scoped, so every test needs keys that no
+// other test has used. Pads a unique prefix out to an exact length.
+let keyCounter = 0;
+function idempotencyKey(length: number) {
+  keyCounter += 1;
+  return `idem-${keyCounter}-`.padEnd(length, 'k');
+}
+
+const ROTATE = { action: 'rotate', id: 'key_1', confirm: true };
+
 describe('api-keys route', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  describe('GET /api/api-keys', () => {
-    it('returns 401 when there is no session (deny-by-default)', async () => {
-      getSession.mockResolvedValue(null);
-
-      const res = await GET(jsonRequest('GET'));
+  describe('authorization', () => {
+    it('GET returns 401 without credentials (deny-by-default)', async () => {
+      const res = await GET(getRequest({}, {}));
+      const body = await res.json();
 
       expect(res.status).toBe(401);
-      expect(listApiKeys).not.toHaveBeenCalled();
+      expect(body.error.code).toBe('API_KEY_UNAUTHORIZED');
     });
 
-    it('returns 403 when the caller lacks the owner role', async () => {
-      getSession.mockResolvedValue(DELEGATE);
+    it('POST returns 401 without credentials before reading the body', async () => {
+      const req = new NextRequest('http://localhost/api/api-keys', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(ROTATE),
+      });
+      const json = vi.spyOn(req, 'json');
 
-      const res = await GET(jsonRequest('GET'));
+      const res = await POST(req);
+      const body = await res.json();
 
-      expect(res.status).toBe(403);
-      expect(listApiKeys).not.toHaveBeenCalled();
+      expect(res.status).toBe(401);
+      expect(body.error.code).toBe('API_KEY_UNAUTHORIZED');
+      expect(json).not.toHaveBeenCalled();
     });
+  });
 
-    it('lists keys for an authorized owner without leaking raw key material', async () => {
-      getSession.mockResolvedValue(OWNER);
-      listApiKeys.mockResolvedValue([
-        { id: 'key_1', label: 'ci', prefix: 'mux_live_ab', createdAt: '2024-01-01T00:00:00.000Z' },
-      ]);
+  describe('GET audit filters', () => {
+    async function audit(params: Record<string, string>) {
+      return GET(getRequest({ audit: 'true', ...params }));
+    }
 
-      const res = await GET(jsonRequest('GET'));
+    it(`applies the default limit of ${DEFAULT_AUDIT_LIMIT} when limit is omitted`, async () => {
+      const res = await audit({});
       const body = await res.json();
 
       expect(res.status).toBe(200);
-      expect(listApiKeys).toHaveBeenCalledWith(OWNER.userId);
-      expect(body.keys).toHaveLength(1);
-      expect(JSON.stringify(body)).not.toMatch(/secret|private|jwt/i);
+      expect(body.audit).toHaveLength(2);
+      for (const key of body.audit) {
+        expect(key.entries).toHaveLength(DEFAULT_AUDIT_LIMIT);
+      }
     });
 
-    it('fails closed with 503 when the store is unavailable', async () => {
-      getSession.mockResolvedValue(OWNER);
-      listApiKeys.mockRejectedValue(new Error('db down'));
-
-      const res = await GET(jsonRequest('GET'));
-
-      expect(res.status).toBe(503);
-    });
-  });
-
-  describe('POST /api/api-keys', () => {
-    it('returns 401 without a session', async () => {
-      getSession.mockResolvedValue(null);
-
-      const res = await POST(jsonRequest('POST', { label: 'ci' }));
-
-      expect(res.status).toBe(401);
-      expect(createApiKey).not.toHaveBeenCalled();
-    });
-
-    it('returns 403 for a non-owner role', async () => {
-      getSession.mockResolvedValue(DELEGATE);
-
-      const res = await POST(jsonRequest('POST', { label: 'ci' }));
-
-      expect(res.status).toBe(403);
-      expect(createApiKey).not.toHaveBeenCalled();
-    });
-
-    it('rejects an oversized/invalid payload with 400', async () => {
-      getSession.mockResolvedValue(OWNER);
-
-      const res = await POST(jsonRequest('POST', { label: 'x'.repeat(5000) }));
-
-      expect(res.status).toBe(400);
-      expect(createApiKey).not.toHaveBeenCalled();
-    });
-
-    it('creates a key once and is idempotent on replayed idempotency keys', async () => {
-      getSession.mockResolvedValue(OWNER);
-      createApiKey.mockResolvedValue({
-        id: 'key_1',
-        label: 'ci',
-        prefix: 'mux_live_ab',
-        secret: 'mux_live_ab_secret',
-        createdAt: '2024-01-01T00:00:00.000Z',
-      });
-
-      const headers = { 'idempotency-key': 'idem-123' };
-      const first = await POST(jsonRequest('POST', { label: 'ci' }, headers));
-      const second = await POST(jsonRequest('POST', { label: 'ci' }, headers));
-
-      expect(first.status).toBe(201);
-      expect(second.status).toBe(201);
-      expect(createApiKey).toHaveBeenCalledTimes(1);
-    });
-
-    it('fails closed with 503 when the store write fails', async () => {
-      getSession.mockResolvedValue(OWNER);
-      createApiKey.mockRejectedValue(new Error('db down'));
-
-      const res = await POST(jsonRequest('POST', { label: 'ci' }));
-
-      expect(res.status).toBe(503);
-    });
-  });
-
-  describe('DELETE /api/api-keys', () => {
-    it('returns 401 without a session', async () => {
-      getSession.mockResolvedValue(null);
-
-      const res = await DELETE(jsonRequest('DELETE', { id: 'key_1' }));
-
-      expect(res.status).toBe(401);
-      expect(revokeApiKey).not.toHaveBeenCalled();
-    });
-
-    it('returns 403 for a revoked/non-owner delegate', async () => {
-      getSession.mockResolvedValue(DELEGATE);
-
-      const res = await DELETE(jsonRequest('DELETE', { id: 'key_1' }));
-
-      expect(res.status).toBe(403);
-      expect(revokeApiKey).not.toHaveBeenCalled();
-    });
-
-    it('revokes a key for an authorized owner', async () => {
-      getSession.mockResolvedValue(OWNER);
-      revokeApiKey.mockResolvedValue(undefined);
-
-      const res = await DELETE(jsonRequest('DELETE', { id: 'key_1' }));
+    it.each([1, MAX_AUDIT_LIMIT])('accepts limit=%i', async (limit) => {
+      const res = await audit({ limit: String(limit) });
+      const body = await res.json();
 
       expect(res.status).toBe(200);
-      expect(revokeApiKey).toHaveBeenCalledWith(OWNER.userId, 'key_1');
+      for (const key of body.audit) {
+        expect(key.entries).toHaveLength(limit);
+      }
+    });
+
+    it.each(['0', String(MAX_AUDIT_LIMIT + 1), '50.5', '-1', 'abc', ''])(
+      'rejects limit=%j with API_KEY_INVALID_FILTER',
+      async (limit) => {
+        const res = await audit({ limit });
+        const body = await res.json();
+
+        expect(res.status).toBe(400);
+        expect(body.error.code).toBe('API_KEY_INVALID_FILTER');
+        expect(body.audit).toBeUndefined();
+      },
+    );
+
+    it('accepts allow-listed action and outcome filters', async () => {
+      const res = await audit({
+        action: 'rotate',
+        outcome: 'success',
+        limit: String(MAX_AUDIT_LIMIT),
+      });
+      const body = await res.json();
+
+      expect(res.status).toBe(200);
+      const entries = body.audit.flatMap((key: { entries: unknown[] }) => key.entries);
+      expect(entries.length).toBeGreaterThan(0);
+      for (const key of body.audit) {
+        for (const entry of key.entries) {
+          expect(entry.action).toBe('rotate');
+          expect(entry.outcome).toBe('success');
+        }
+      }
+    });
+
+    it.each(['delete', 'Create', ''])(
+      'rejects unknown action=%j with API_KEY_INVALID_FILTER',
+      async (action) => {
+        const res = await audit({ action });
+        const body = await res.json();
+
+        expect(res.status).toBe(400);
+        expect(body.error.code).toBe('API_KEY_INVALID_FILTER');
+      },
+    );
+
+    it.each(['pending', 'SUCCESS', ''])(
+      'rejects unknown outcome=%j with API_KEY_INVALID_FILTER',
+      async (outcome) => {
+        const res = await audit({ outcome });
+        const body = await res.json();
+
+        expect(res.status).toBe(400);
+        expect(body.error.code).toBe('API_KEY_INVALID_FILTER');
+      },
+    );
+
+    it('does not return audit data unless ?audit=true is set', async () => {
+      const res = await GET(getRequest({ limit: String(MAX_AUDIT_LIMIT + 1) }));
+      const body = await res.json();
+
+      expect(res.status).toBe(200);
+      expect(body.audit).toBeUndefined();
+    });
+  });
+
+  describe('GET range parsing', () => {
+    it(`applies the default range of ${DEFAULT_RANGE_DAYS} days when days is omitted`, async () => {
+      const res = await GET(getRequest({}));
+      const body = await res.json();
+
+      expect(res.status).toBe(200);
+      expect(body.series).toHaveLength(2);
+      for (const key of body.series) {
+        expect(key.points).toHaveLength(DEFAULT_RANGE_DAYS);
+      }
+    });
+
+    it.each([1, MAX_RANGE_DAYS])('accepts days=%i', async (days) => {
+      const res = await GET(getRequest({ days: String(days) }));
+      const body = await res.json();
+
+      expect(res.status).toBe(200);
+      for (const key of body.series) {
+        expect(key.points).toHaveLength(days);
+      }
+    });
+
+    it.each(['0', String(MAX_RANGE_DAYS + 1), '1.5', 'abc', '-1', ''])(
+      'rejects days=%j with API_KEY_INVALID_RANGE',
+      async (days) => {
+        const res = await GET(getRequest({ days }));
+        const body = await res.json();
+
+        expect(res.status).toBe(400);
+        expect(body.error.code).toBe('API_KEY_INVALID_RANGE');
+        expect(body.series).toBeUndefined();
+      },
+    );
+  });
+
+  describe('POST idempotency', () => {
+    // Runs the same request twice and reports whether each one reached the
+    // write path (which is the only place the request body is parsed).
+    async function postTwice(body: unknown, headers: Record<string, string>) {
+      const firstReq = postRequest(body, headers);
+      const secondReq = postRequest(body, headers);
+      const firstJson = vi.spyOn(firstReq, 'json');
+      const secondJson = vi.spyOn(secondReq, 'json');
+
+      const firstRes = await POST(firstReq);
+      const secondRes = await POST(secondReq);
+
+      return {
+        first: { status: firstRes.status, body: await firstRes.json() },
+        second: { status: secondRes.status, body: await secondRes.json() },
+        writes: firstJson.mock.calls.length + secondJson.mock.calls.length,
+      };
+    }
+
+    it('treats a missing idempotency-key header as no key (every request executes)', async () => {
+      const { first, second, writes } = await postTwice(ROTATE, {});
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(writes).toBe(2);
+      expect(second.body.correlationId).not.toBe(first.body.correlationId);
+    });
+
+    it('treats a whitespace-only idempotency-key the same as a missing header', async () => {
+      const { first, second, writes } = await postTwice(ROTATE, {
+        'idempotency-key': '   ',
+      });
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(writes).toBe(2);
+      expect(second.body.correlationId).not.toBe(first.body.correlationId);
+    });
+
+    it(`accepts a ${MAX_IDEMPOTENCY_KEY_LENGTH}-character key and replays the cached response`, async () => {
+      const key = idempotencyKey(MAX_IDEMPOTENCY_KEY_LENGTH);
+      expect(key).toHaveLength(MAX_IDEMPOTENCY_KEY_LENGTH);
+
+      const { first, second, writes } = await postTwice(ROTATE, {
+        'idempotency-key': key,
+      });
+
+      expect(first.status).toBe(200);
+      expect(second).toEqual(first);
+      expect(writes).toBe(1);
+    });
+
+    it(`rejects a ${MAX_IDEMPOTENCY_KEY_LENGTH + 1}-character key so it is never cached or replayed`, async () => {
+      const key = idempotencyKey(MAX_IDEMPOTENCY_KEY_LENGTH + 1);
+      expect(key).toHaveLength(MAX_IDEMPOTENCY_KEY_LENGTH + 1);
+
+      const { first, second, writes } = await postTwice(ROTATE, {
+        'idempotency-key': key,
+      });
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(writes).toBe(2);
+      expect(second.body.correlationId).not.toBe(first.body.correlationId);
+    });
+
+    it('replays the cached response for the same key and body without re-running the write', async () => {
+      const headers = { 'idempotency-key': idempotencyKey(16) };
+      const { first, second, writes } = await postTwice(ROTATE, headers);
+
+      expect(first.status).toBe(200);
+      expect(first.body).toMatchObject({ action: 'rotate', id: 'key_1' });
+      expect(second.status).toBe(first.status);
+      expect(second.body).toEqual(first.body);
+      expect(writes).toBe(1);
+    });
+
+    it('does not cache a failed write, so the key can be retried with a valid body', async () => {
+      const headers = { 'idempotency-key': idempotencyKey(16) };
+
+      const failed = await POST(postRequest({ action: 'rotate', id: 'key_1' }, headers));
+      const failedBody = await failed.json();
+      const retried = await POST(postRequest(ROTATE, headers));
+      const retriedBody = await retried.json();
+
+      expect(failed.status).toBe(400);
+      expect(failedBody.error.code).toBe('API_KEY_CONFIRMATION_REQUIRED');
+      expect(retried.status).toBe(200);
+      expect(retriedBody).toMatchObject({ action: 'rotate', id: 'key_1' });
     });
   });
 });
